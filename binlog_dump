@@ -1,0 +1,164 @@
+#!/bin/bash
+
+## Copyright (C) 2009 LiShaolin <lslxdx@163.com>
+##
+## This script is licensed under the terms of the MIT license.
+## https://opensource.org/licenses/MIT
+
+USER=root
+PASSWD=''
+HOST=localhost
+PORT=3306
+
+#USER=mysql_user_name
+#PASSWD='mysql_passwd'
+#HOST='mysql.server.ip.or.domain'
+#PORT=3306
+
+DATA_PATH=
+TMP_PATH=
+BINLOG_PATH=
+
+show_usage(){
+  echo 'Invalid argument list. Usage:'
+  echo 'binlog_dump <data_path>'
+}
+
+source lockable.sh
+
+query_log_pos(){
+  if [[ -n "$PASSWD" ]]
+  then
+    mysql -u$USER -p$PASSWD -h$HOST -P$PORT -e "show binary logs;" | awk 'NR>1{print $0}'> "$TMP_PATH/show_binary_logs.tmp"
+  else
+    mysql -u$USER           -h$HOST -P$PORT -e "show binary logs;" | awk 'NR>1{print $0}'> "$TMP_PATH/show_binary_logs.tmp"
+  fi
+}
+
+compare_log_pos(){
+  :>"$DATA_PATH/mysqlbinlog.task"
+  awk '{print $1,$2}' "$TMP_PATH/show_binary_logs.tmp" | while read log_tmp pos_tmp
+  do
+    read pos_all < <(grep "^$log_tmp\s\+[0-9]\+$" -o "$DATA_PATH/show_binary_logs.all"|awk '{print $2}')
+    if [[ $? -eq 0 ]]
+    then
+      # local.size == remote.size; skip
+      if [[ $pos_all -eq $pos_tmp ]]
+      then
+        continue
+      elif [[ $pos_all -lt $pos_tmp ]]
+      then
+        # local.size < remote.size; dump delta
+        echo "$log_tmp $pos_all $pos_tmp" >> "$DATA_PATH/mysqlbinlog.task"
+        continue
+      fi
+    fi
+    # local not exists or local.size > remote.size; dump all
+    echo "$log_tmp 0 $pos_tmp"            >> "$DATA_PATH/mysqlbinlog.task"
+  done 
+}
+
+upsert_show_binary_logs(){
+  local log
+  local stop_pos
+
+  if [[ $# -ge 2 ]]
+  then
+    log=$1
+    stop_pos=$2
+    if [ $(uname) = 'Linux' ]
+    then
+      sed -i "/^$log /d"     "$DATA_PATH/show_binary_logs.all"
+    else
+      sed -i '' "/^$log /d"  "$DATA_PATH/show_binary_logs.all"
+    fi 
+    echo "$log $stop_pos" >> "$DATA_PATH/show_binary_logs.all"
+  fi
+}
+
+log_created_at(){
+  grep -m 1 '^#[0-9]\+ .\+ created [0-9]\+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\( at startup\)\?$' "$1"|grep -o " created [0-9]\+ [0-9][0-9]:[0-9][0-9]:[0-9][0-9]"
+}
+
+is_log_rotated(){
+  local created_at_1
+  local created_at_2
+  created_at_1="$(log_created_at "$1")"
+  created_at_2="$(log_created_at "$2")"
+  if [[ -z "$created_at_1" || -z "$created_at_2" || "$created_at_1" = "$created_at_2" ]]; then echo "0"; else echo "1"; fi;
+}
+
+exec_mysqlbinlog_task(){
+  local log
+  local start_pos
+  local stop_pos
+
+  while read log start_pos stop_pos
+  do
+    if [[ -n "$PASSWD" ]]
+    then
+      mysqlbinlog -u$USER -p$PASSWD -h$HOST -P$PORT --read-from-remote-server "$log" --start-position="$start_pos" --stop-position="$stop_pos" -vv > "$TMP_PATH/$log.tmp"
+    else
+      mysqlbinlog -u$USER           -h$HOST -P$PORT --read-from-remote-server "$log" --start-position="$start_pos" --stop-position="$stop_pos" -vv > "$TMP_PATH/$log.tmp"
+    fi
+
+    local head_n=$(echo "$(wc -l "$TMP_PATH/$log.tmp"|awk '{print $1}')-5"|bc)
+    if [[ $head_n -ge 1 ]]
+    then
+      # check whether the remote log is rotated by content
+      if [[ "$(is_log_rotated "$TMP_PATH/$log.tmp" "$BINLOG_PATH/$log")" = '0' ]]
+      then
+        if [[ $start_pos -gt 0 ]]
+        then
+          head -n $head_n "$TMP_PATH/$log.tmp"|awk 'NR>4{print $0}' |tee -a "$BINLOG_FILE" >> "$BINLOG_PATH/$log"
+        else
+          head -n $head_n "$TMP_PATH/$log.tmp"|awk 'NR>4{print $0}' |tee -a "$BINLOG_FILE"  > "$BINLOG_PATH/$log"
+        fi
+        # this line is used by the 'multiline' codec of 'Logstash' to determine 'the end of prevous lines'
+        echo "# EOF by 'binlog_dump' script" >> "$BINLOG_FILE"
+        upsert_show_binary_logs "$log" "$stop_pos"
+      else
+        # if the remote log is rotated then reset the local log.
+        # Please notice that we DO NOT dump the new one immediately just to avoid infinitely dump!
+        echo "log[$log] is rotated, [$BINLOG_PATH/$log] will be reset and the NEW ONE will be dumped NEXT TIME." 1>&2
+        :>"$BINLOG_PATH/$log"
+        upsert_show_binary_logs "$log" "0"
+      fi
+    fi
+  done < "$DATA_PATH/mysqlbinlog.task"
+}
+
+rm_tmp_files(){
+  find "$TMP_PATH" -name '*.tmp' -type f -delete
+}
+
+main(){
+  if [[ $# -lt 1 ]]; then show_usage; exit 1;fi
+
+  if [[ ! -w "$1" || ! -d "$1" ]]; then echo "Cannot write to directory [$1]."; exit 1; fi
+  DATA_PATH="$(cd "$1"; pwd)" 
+  TMP_PATH="$DATA_PATH/tmp.d"
+  BINLOG_PATH="$DATA_PATH/binlog.d"
+  BINLOG_FILE="$DATA_PATH/binlog.log"
+
+  exec 2> >(while read line; do echo "[$(date "+%Y-%m-%d %H:%M:%S")] $line"|tee -a "$DATA_PATH/error.log"; done)
+
+  if type flock &>/dev/null
+  then
+    _prepare_locking
+    if ! exlock_now; then echo "Fail to lock [$LOCKFILE]" 1<&2; exit 1; fi;
+  else
+    echo "Running in non-single-instance mode due to [$(type flock 2<&1)]" 1<&2
+  fi
+
+  mkdir -p "$TMP_PATH" "$BINLOG_PATH"
+
+  echo 'Running...'
+  query_log_pos
+  compare_log_pos
+  exec_mysqlbinlog_task
+  rm_tmp_files
+  echo 'Done.'
+}
+
+main "$@"
